@@ -1,288 +1,359 @@
-'use client';
+"use client";
 
-import { useEffect, useRef, useState } from 'react';
-import { TelnyxRTC, Call } from '@telnyx/webrtc';
-import { IClientOptions } from '@telnyx/webrtc';
+import { useEffect, useRef, useState, useCallback } from "react";
+import { TelnyxRTC, Call } from "@telnyx/webrtc";
 
-type Ready = 'connecting' | 'ready' | 'error';
+type ConnectionState = "connecting" | "ready" | "error" | "disconnected";
+type CallState =
+  | "new"
+  | "ringing"
+  | "active"
+  | "held"
+  | "hangup"
+  | "destroy"
+  | "answering";
+type CallDirection = "inbound" | "outbound";
+
+interface IncomingCall {
+  from: string;
+  to: string;
+  call: Call;
+}
+
+const DEBUG = false; // 🔧 toggle for verbose logging
 
 export default function PhonePanel() {
   const clientRef = useRef<TelnyxRTC | null>(null);
-  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
 
-  const [ready, setReady] = useState<Ready>('connecting');
+  const [connectionState, setConnectionState] =
+    useState<ConnectionState>("connecting");
   const [activeCall, setActiveCall] = useState<Call | null>(null);
-  const [dest, setDest] = useState('');
-  const [status, setStatus] = useState('Idle');
+  const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
+  const [dest, setDest] = useState("");
+  const [status, setStatus] = useState("Connecting...");
   const [muted, setMuted] = useState(false);
-  const [iceServers, setIceServers] = useState<any[]>([]);
-  const [incomingCall, setIncomingCall] = useState<{from: string, to: string} | null>(null);
+
+  const outboundCallsRef = useRef<Set<string>>(new Set());
+
+  // ===== Helpers =====
+
+  const log = (...args: any[]) => {
+    if (DEBUG) console.log(...args);
+  };
+
+  const cleanupCall = useCallback(() => {
+    setActiveCall(null);
+    setIncomingCall(null);
+    setMuted(false);
+    setStatus(connectionState === "ready" ? "Ready" : "Disconnected");
+
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = null;
+    }
+  }, [connectionState]);
+
+  const handleRemoteStream = useCallback((call: Call) => {
+    if (remoteAudioRef.current && (call as any).remoteStream) {
+      remoteAudioRef.current.srcObject = (call as any).remoteStream;
+      remoteAudioRef.current.play().catch((err) =>
+        console.error("Failed to play remote audio:", err)
+      );
+    }
+  }, []);
+
+  const handleCallUpdate = useCallback(
+    (call: Call) => {
+      if (!call) return;
+
+      const callState = call.state as CallState;
+      const direction = call.direction as CallDirection;
+      log("Call update:", {
+        id: call.id,
+        state: callState,
+        direction,
+        causeCode: (call as any).causeCode,
+      });
+
+      if (callState === "ringing" && call.options.callerName !== "") {
+        const from = (call as any).remoteCallerNumber || "Unknown";
+        const to = (call as any).destinationNumber || "You";
+        setIncomingCall({ from, to, call });
+        setStatus(`Incoming: ${from}`);
+      }
+
+      if (callState === "active") {
+        setActiveCall(call);
+        setIncomingCall(null);
+        setStatus("Connected");
+        setTimeout(() => handleRemoteStream(call), 500);
+      }
+
+      if (["hangup", "destroy"].includes(callState)) {
+        outboundCallsRef.current.delete(call.id);
+        cleanupCall();
+      }
+    },
+    [cleanupCall, handleRemoteStream]
+  );
+
+  // ===== Init Client =====
 
   useEffect(() => {
     let disposed = false;
-    (async () => {
+
+    const initClient = async () => {
       try {
-        const r = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/telnyx/webrtc/token`, { method: 'POST' });
-        if (!r.ok) throw new Error('Token fetch failed');
-        const j = await r.json();
-        const loginToken = j?.data?.login_token;
-        const ice = j?.data?.ice_servers;
-        if (!loginToken) throw new Error('Missing login token');
-        setIceServers(ice || []);
+        setConnectionState("connecting");
+        setStatus("Fetching token...");
 
-        interface ExtendedClientOptions extends IClientOptions {
-          iceServers?: RTCIceServer[];
-        }
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_API_URL}/telnyx/webrtc/token`,
+          { method: "POST" }
+        );
 
-        const client = new TelnyxRTC({
-          login_token: loginToken,
-          iceServers: ice || [
-            { urls: 'stun:stun.telnyx.com:3478' },
-            { urls: 'stun:stun.l.google.com:19302' }
-          ]
-        } as ExtendedClientOptions);
+        if (!res.ok) throw new Error("Token fetch failed");
 
-        // Handle incoming calls
-        client.on('telnyx.notification', (notification: any) => {
+        const data = await res.json();
+        const loginToken =
+          data?.data?.login_token ?? data?.login_token ?? data?.data;
+
+        if (!loginToken) throw new Error("Missing login token");
+
+        const client = new TelnyxRTC({ login_token: loginToken });
+
+        client.on("telnyx.ready", () => {
           if (disposed) return;
-          
-          if (notification.type === 'callUpdate' && notification.call) {
-            const call = notification.call;
-            const callState = call.state || call.status;
-            
-            if (call.direction === 'incoming' && callState === 'ringing') {
-              setActiveCall(call);
-              setIncomingCall({
-                from: call.callerNumber || 'Unknown',
-                to: call.destinationNumber || 'Unknown'
-              });
-              setStatus('Incoming call...');
-            }
+          log("WebRTC client ready");
+          setConnectionState("ready");
+          setStatus("Ready for calls");
+        });
+
+        client.on("telnyx.error", (err: any) => {
+          if (disposed) return;
+          console.error("WebRTC error:", err);
+          setConnectionState("error");
+          setStatus("Connection error");
+        });
+
+        client.on("telnyx.socket.open", () => log("Socket connected"));
+        client.on("telnyx.socket.close", () => {
+          if (disposed) return;
+          setConnectionState("disconnected");
+          setStatus("Disconnected");
+        });
+
+        client.on("telnyx.notification", (n: any) => {
+          if (disposed) return;
+          const { type, call } = n;
+
+          if (type === "callUpdate" && call) {
+            handleCallUpdate(call);
+          } else if (type === "userMediaError") {
+            console.error("Media error:", n);
+            setStatus("Microphone access denied");
           }
         });
 
-        client.on('telnyx.ready', () => {
-          if (!disposed) {
-            setReady('ready');
-            setStatus('Ready');
-          }
-        });
-        
-        client.on('telnyx.error', () => {
-          if (!disposed) {
-            setReady('error');
-            setStatus('Error');
-          }
-        });
-        
-        client.on('callUpdate', (call: Call) => {
-          if (disposed) return;
-          const callState = (call as any).state || (call as any).status || 'unknown';
-          
-          if (['ended', 'hangup', 'rejected', 'failed'].includes(callState.toLowerCase())) {
-            setActiveCall(null);
-            setIncomingCall(null);
-            setStatus('Ready');
-            setMuted(false);
-            return;
-          }
-          
-          const stream: MediaStream | undefined = (call as any).remoteStream || (call as any).remoteMediaStream;
-          if (remoteAudioRef.current && stream) {
-            (remoteAudioRef.current as any).srcObject = stream;
-            remoteAudioRef.current.play().catch(() => {});
-          }
-          
-          setActiveCall(call);
-          setStatus(formatStatus(call));
-        });
-        
-        client.on('call.hangup', () => {
-          setActiveCall(null);
-          setIncomingCall(null);
-          setStatus('Ready');
-          setMuted(false);
-        });
-        
-        client.on('call.ended', () => {
-          setActiveCall(null);
-          setIncomingCall(null);
-          setStatus('Ready');
-          setMuted(false);
-        });
-        
         clientRef.current = client;
+        log("Connecting WebRTC client...");
         client.connect();
-      } catch {
-        setReady('error');
-        setStatus('Error');
+      } catch (err) {
+        if (disposed) return;
+        console.error("Client init failed:", err);
+        setConnectionState("error");
+        setStatus(
+          `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+        );
       }
-    })();
-    
+    };
+
+    initClient();
+
     return () => {
       disposed = true;
       if (clientRef.current) {
-        clientRef.current.disconnect();
+        try {
+          log("Disconnecting WebRTC client...");
+          clientRef.current.disconnect();
+        } catch (err) {
+          console.error("Disconnect failed:", err);
+        }
         clientRef.current = null;
       }
     };
   }, []);
 
-  const call = () => {
+  // ===== Call Controls =====
+
+  const makeCall = () => {
     if (!clientRef.current || !dest) return;
+
+    const newCall = clientRef.current.newCall({
+      callerNumber: process.env.NEXT_PUBLIC_TELNYX_DEFAULT_FROM!,
+      destinationNumber: dest,
+      audio: true,
+    });
+
+    if (newCall?.id) outboundCallsRef.current.add(newCall.id);
+    setStatus("Dialing...");
+  };
+
+  const answerCall = async () => {
+    if (!incomingCall?.call) return;
+
     try {
-      setStatus('Initiating call...');
-      clientRef.current.newCall({
-        callerNumber: process.env.NEXT_PUBLIC_TELNYX_DEFAULT_FROM,
-        destinationNumber: dest,
-        audio: true,
-        video: false,
-        iceServers: iceServers,
-        debug: true,
-      });
-      setStatus('Call initiated');
-    } catch (error) {
-      console.error('Call failed:', error);
-      setStatus('Ready');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      (incomingCall.call as any).options.localStream = stream;
+      incomingCall.call.answer();
+      setStatus("Answering...");
+    } catch (err) {
+      console.error("Answer failed:", err);
+      setStatus("Failed to answer");
     }
   };
 
-  const answer = () => {
-    if (!activeCall) return;
+  const rejectCall = () => {
+    if (!incomingCall?.call) return;
+
     try {
-      activeCall.answer();
-      setIncomingCall(null);
-      setStatus('Call answered');
-    } catch {}
+      incomingCall.call.hangup();
+      cleanupCall();
+    } catch (err) {
+      console.error("Reject failed:", err);
+    }
   };
 
-  const reject = () => {
+  const hangupCall = () => {
     if (!activeCall) return;
-    try {
-      activeCall.hangup();
-      setIncomingCall(null);
-      setStatus('Call rejected');
-    } catch {}
-  };
 
-  const hangup = () => {
-    if (!activeCall) return;
     try {
       activeCall.hangup();
-    } catch {}
-    setActiveCall(null);
-    setIncomingCall(null);
-    setStatus('Ready');
-    setMuted(false);
+    } catch (err) {
+      console.error("Hangup failed:", err);
+    }
   };
 
   const toggleMute = () => {
     if (!activeCall) return;
+
     try {
       if (muted) {
-        activeCall.unmuteAudio();
+        (activeCall as any).unmuteAudio?.() || (activeCall as any).unmute?.();
+        setMuted(false);
       } else {
-        activeCall.muteAudio();
+        (activeCall as any).muteAudio?.() || (activeCall as any).mute?.();
+        setMuted(true);
       }
-      setMuted(!muted);
-    } catch {}
+    } catch (err) {
+      console.error("Mute toggle failed:", err);
+    }
   };
 
-  const sendDTMF = (d: string) => {
+  const sendDTMF = (digit: string) => {
     if (!activeCall) return;
+
     try {
-      (activeCall as any)?.dtmf?.(d);
-    } catch {}
+      (activeCall as any).dtmf?.(digit);
+    } catch (err) {
+      console.error("DTMF failed:", err);
+    }
   };
+
+  const getStatusColor = () => {
+    switch (connectionState) {
+      case "ready":
+        return "text-green-600 font-semibold";
+      case "connecting":
+        return "text-blue-600";
+      case "error":
+        return "text-red-600";
+      default:
+        return "text-gray-600";
+    }
+  };
+
+  const isCallInProgress = activeCall || incomingCall;
+
+  // ===== UI =====
 
   return (
     <div className="w-[450px] rounded-2xl bg-white shadow-xl p-5 grid gap-3 text-black">
       <h2 className="text-xl font-semibold">Haraz • Telnyx Phone</h2>
-      <div className="text-xs">Status: <span className="font-medium">{status}</span></div>
-      
-      {/* Incoming call notification */}
-      {incomingCall && (
-        <div className="bg-blue-100 p-3 rounded-lg border border-blue-300">
-          <div className="font-semibold text-blue-800">Incoming Call</div>
-          <div className="text-sm">From: {incomingCall.from}</div>
-          <div className="text-sm">To: {incomingCall.to}</div>
-          <div className="flex gap-2 mt-2">
-            <button 
-              onClick={answer}
-              className="flex-1 bg-green-500 text-white py-1 rounded-md font-medium"
-            >
-              Answer
-            </button>
-            <button 
-              onClick={reject}
-              className="flex-1 bg-red-500 text-white py-1 rounded-md font-medium"
-            >
-              Reject
-            </button>
-          </div>
-        </div>
-      )}
-      
+
+      <div className="text-xs">
+        Connection: <span className={getStatusColor()}>{connectionState}</span>
+      </div>
+      <div className="text-xs">
+        Status: <span className="font-medium">{status}</span>
+      </div>
+
+      <audio ref={remoteAudioRef} autoPlay playsInline hidden />
+
       <input
         className="h-11 px-3 rounded-xl border border-slate-300 outline-none placeholder:text-black/40 text-black"
         placeholder="+15556667777"
         value={dest}
         onChange={(e) => setDest(e.target.value)}
+        type="tel"
       />
-      <div className="grid grid-flow-col gap-2">
-        <Btn onClick={call} disabled={ready !== 'ready' || status !== 'Ready'} color="sky" textBlack>Call</Btn>
-        <Btn onClick={answer} disabled={!incomingCall} color="green" textBlack>Answer</Btn>
-        <Btn onClick={hangup} disabled={!activeCall && !incomingCall} color="red" textBlack>Hangup</Btn>
-        <Btn onClick={toggleMute} disabled={!activeCall} color="slate" textBlack>{muted ? 'Unmute' : 'Mute'}</Btn>
+
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          onClick={makeCall}
+          disabled={connectionState !== "ready" || !dest || !!isCallInProgress}
+          className="h-10 bg-sky-300 text-black rounded-lg font-semibold disabled:opacity-40 hover:bg-sky-400"
+        >
+          Call
+        </button>
+        <button
+          onClick={hangupCall}
+          disabled={!activeCall}
+          className="h-10 bg-rose-300 text-black rounded-lg font-semibold disabled:opacity-40 hover:bg-rose-400"
+        >
+          Hangup
+        </button>
       </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          onClick={toggleMute}
+          disabled={!activeCall}
+          className={`h-10 rounded-lg font-semibold disabled:opacity-40 ${
+            muted
+              ? "bg-yellow-300 hover:bg-yellow-400"
+              : "bg-slate-300 hover:bg-slate-400"
+          }`}
+        >
+          {muted ? "Unmute" : "Mute"}
+        </button>
+        <button
+          onClick={answerCall}
+          disabled={!incomingCall}
+          className="h-10 bg-emerald-300 text-black rounded-lg font-semibold disabled:opacity-40 hover:bg-emerald-400"
+        >
+          Answer
+        </button>
+      </div>
+
       <div className="grid grid-cols-3 gap-2">
-        {['1','2','3','4','5','6','7','8','9','*','0','#'].map(d => (
-          <button
-            key={d}
-            onClick={() => sendDTMF(d)}
-            disabled={!activeCall}
-            className="h-11 rounded-xl border border-slate-300 bg-white font-semibold disabled:opacity-40"
-          >
-            {d}
-          </button>
-        ))}
+        {["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"].map(
+          (digit) => (
+            <button
+              key={digit}
+              onClick={() => sendDTMF(digit)}
+              disabled={!activeCall}
+              className="h-11 rounded-xl border border-slate-300 bg-white font-semibold disabled:opacity-40 hover:bg-gray-50"
+            >
+              {digit}
+            </button>
+          )
+        )}
       </div>
-      <audio ref={remoteAudioRef} autoPlay playsInline />
-      <p className="text-xs">Outbound calls are initiated from the browser using the Telnyx WebRTC SDK.</p>
+
+      <div className="text-xs text-gray-600">
+        {connectionState === "ready" ? "Ready for calls" : "Connecting..."}
+      </div>
     </div>
   );
-}
-
-function Btn(
-  props: { onClick?: () => void; disabled?: boolean; color: 'sky'|'green'|'red'|'slate'; children: any; textBlack?: boolean }
-) {
-  const map: Record<string, string> = {
-    sky: 'bg-sky-300 hover:bg-sky-400',
-    green: 'bg-emerald-300 hover:bg-emerald-400',
-    red: 'bg-rose-300 hover:bg-rose-400',
-    slate: 'bg-slate-300 hover:bg-slate-400',
-  };
-  return (
-    <button
-      onClick={props.onClick}
-      disabled={props.disabled}
-      className={`h-10 rounded-lg font-semibold disabled:opacity-40 ${map[props.color]} ${props.textBlack ? 'text-black' : 'text-white'}`}
-    >
-      {props.children}
-    </button>
-  );
-}
-
-function formatStatus(call: Call | null): string {
-  if (!call) return 'Idle';
-  const dir = (call as any).direction || '';
-  const s = (call as any).state || (call as any).status || '';
-  return `${dir ? dir + ' • ' : ''}${s || 'active'}`;
-}
-
-function isIncomingRinging(call: Call | null) {
-  if (!call) return false;
-  const dir = (call as any).direction;
-  const s = (call as any).state || (call as any).status;
-  return dir === 'incoming' && (s === 'ringing' || s === 'new' || s === 'invite');
 }
